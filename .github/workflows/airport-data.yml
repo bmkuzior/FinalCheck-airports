@@ -1,0 +1,91 @@
+# Builds airports.json from each new FAA NASR cycle, signs it, and publishes it as a release on
+# this repo. The FinalCheck app polls releases/latest/download/manifest.json.
+#
+# Needs one secret: AIRPORTS_SIGNING_KEY (Ed25519 private key PEM). Its public half is compiled
+# into the app (AirportUpdateConfig.publicKeyBase64); a file signed with any other key is refused.
+name: Airport data
+
+on:
+  schedule:
+    - cron: "17 6 * * *"   # daily; does nothing unless a new cycle is in effect
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and replace the release even if this cycle is already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create releases
+
+concurrency:
+  group: airport-data
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the cycle in effect
+        id: cycle
+        run: |
+          cycle=$(python3 Tools/fetch_nasr.py --print-cycle)
+          echo "date=$cycle" >> "$GITHUB_OUTPUT"
+          if gh release view "nasr-$cycle" >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "Cycle $cycle is already published"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache geoid grid
+        if: steps.cycle.outputs.published == 'false' || inputs.force
+        uses: actions/cache@v4
+        with:
+          path: nasr/geoid
+          key: egm96-15-gtx
+
+      - name: Download NASR
+        if: steps.cycle.outputs.published == 'false' || inputs.force
+        run: python3 Tools/fetch_nasr.py --out nasr --cycle "${{ steps.cycle.outputs.date }}"
+
+      - name: Build airports.json
+        if: steps.cycle.outputs.published == 'false' || inputs.force
+        run: |
+          mkdir -p build
+          python3 Tools/build_airports.py --nasr nasr --geoid nasr/geoid/egm96_15.gtx --out build/airports.json
+          # Same floor the app enforces; a broken FAA file must not get as far as signing.
+          python3 - <<'EOF'
+          import json
+          db = json.load(open("build/airports.json"))
+          ids = {a["ident"] for a in db["airports"]}
+          assert len(db["airports"]) >= 600, len(db["airports"])
+          assert {"KYNG", "KCLE"} <= ids
+          assert db["effectiveDate"] == "${{ steps.cycle.outputs.date }}", db["effectiveDate"]
+          EOF
+
+      - name: Sign
+        if: steps.cycle.outputs.published == 'false' || inputs.force
+        env:
+          AIRPORTS_SIGNING_KEY: ${{ secrets.AIRPORTS_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$AIRPORTS_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          python3 Tools/sign_airports.py --key "$RUNNER_TEMP/key.pem" --airports build/airports.json --out dist
+          rm -f "$RUNNER_TEMP/key.pem"
+
+      - name: Publish release
+        if: steps.cycle.outputs.published == 'false' || inputs.force
+        run: |
+          tag="nasr-${{ steps.cycle.outputs.date }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/airports.json dist/manifest.json --clobber
+          else
+            gh release create "$tag" dist/airports.json dist/manifest.json --latest \
+              --title "FAA NASR ${{ steps.cycle.outputs.date }}" \
+              --notes "Open towered US airports from FAA NASR cycle ${{ steps.cycle.outputs.date }}, signed for FinalCheck in-app updates. Advisory data: verify against the Chart Supplement."
+          fi
